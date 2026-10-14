@@ -172,6 +172,108 @@ Returns `{ "activity": ActivityRecord }`.
 
 ## Policy
 
+### PolicyRules
+
+`PolicyRules` is the body of `PUT /agents/:id/policy` and the `policy` field of
+`GET /agents/:id/policy`. It is declared in `packages/policy/src/types.ts` and
+mirrored in `packages/shared/src/types.ts`. Every field is optional on write:
+`normalizePolicyRules` merges the body over `DEFAULT_RULES` before storage, so
+`PUT {}` stores the defaults below at `version: 1`.
+
+| Field | Type | Default (`DEFAULT_RULES`) | Meaning |
+| --- | --- | --- | --- |
+| `maxTxAmount` | `Record<string, string>` | `{ "XLM": "100" }` | Per-asset ceiling for a single transaction, keyed by asset notation (see below). |
+| `dailySpendingLimit` | `Record<string, string>` | `{ "XLM": "500" }` | Per-asset ceiling for everything the agent spends in the current UTC day. Requires an activity store; without one the check is skipped. |
+| `allowedAssets` | `string[]` | `["XLM"]` | Asset notations the agent may touch at all. An empty array disables the check. |
+| `allowedDestinations` | `string[]` | `[]` | Stellar accounts (`G…`, 56 chars) the agent may pay. An empty array disables the check. |
+| `allowedContractIds` | `string[]` | `[]` | Soroban contract ids the agent may call. An empty array disables the check. |
+| `txTypeRestrictions` | `Record<string, boolean>` | `{ "payment": true, "trustline": true, "contract_call": false, "account_settings": false }` | Which intent types the agent may submit. |
+| `approvalThreshold` | `string` | `"50"` | Amount at or above which an operation needs human approval. |
+| `requireHumanApprovalForAmountAbove` | `string` | `"50"` | Long-form alias of `approvalThreshold`. |
+
+Amounts are strings because they are asset amounts rather than IEEE floats:
+`"100"`, not `100`. They are compared with `parseFloat`, so `"100"` and
+`"100.0"` behave identically. `approvalThreshold` and
+`requireHumanApprovalForAmountAbove` are aliases — `normalizePolicyRules` copies
+whichever one you sent into the other, so reading a policy back always returns
+both with the same value.
+
+#### Merge semantics
+
+`normalizePolicyRules` treats the two kinds of field differently, which matters
+when you send a partial body:
+
+- **Object-valued fields merge with the defaults.** `maxTxAmount`,
+  `dailySpendingLimit` and `txTypeRestrictions` are spread over
+  `DEFAULT_RULES`, so `PUT {"maxTxAmount": {"USDC:G…": "10"}}` stores
+  `{ "XLM": "100", "USDC:G…": "10" }` — the default `XLM` entry is still there.
+  Set a key to a new value to override it; you cannot delete a default key by
+  omitting it.
+- **Array-valued fields replace.** `allowedAssets`, `allowedDestinations` and
+  `allowedContractIds` are taken from the body when present and from
+  `DEFAULT_RULES` when absent, so `PUT {"allowedAssets": ["USDC:G…"]}` removes
+  `XLM` from the allowlist entirely.
+
+#### Asset notation
+
+The policy engine resolves every intent to one asset string
+(`packages/policy/src/engine.ts`, `extractAsset`) and uses that string both as
+the key into `maxTxAmount` / `dailySpendingLimit` and as the entry matched
+against `allowedAssets`:
+
+- a native payment resolves to `XLM`;
+- any other payment resolves to `CODE:ISSUER`, e.g.
+  `USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN`;
+- a `trustline` intent resolves to `trustline:CODE:ISSUER`;
+- every other intent type resolves to `native`.
+
+`maxTxAmount` and `dailySpendingLimit` are read as
+`rules.maxTxAmount[asset] ?? rules.maxTxAmount["native"]`, so a `native` key acts
+as the fallback for any asset that has no exact key of its own. `allowedAssets`
+has no such fallback — it is a plain `includes` on the resolved asset string, so
+a trustline is only allowed when the list literally contains
+`trustline:CODE:ISSUER`, and the default `["XLM"]` denies every non-native
+payment.
+
+#### Validation
+
+`PUT /agents/:id/policy` runs `validatePolicyRules` and answers `400` with
+`{"error":"invalid policy","details":[...]}` when it fails. The rules are:
+
+- the body must be an object;
+- `maxTxAmount` and `dailySpendingLimit` must be objects, and every value must
+  parse as a finite number — strictly greater than zero for `maxTxAmount`,
+  zero or greater for `dailySpendingLimit`;
+- `approvalThreshold` and `requireHumanApprovalForAmountAbove` must parse as
+  finite and non-negative;
+- `allowedAssets` and `allowedContractIds` must be arrays of non-empty strings;
+- `allowedDestinations` must be an array of valid Stellar addresses: `G`
+  followed by 55 more characters (56 in total);
+- `txTypeRestrictions` keys must be one of `payment`, `trustline`,
+  `contract_call`, `account_settings`, and every value must be a boolean.
+
+`details` carries one string per problem, e.g.
+`allowedDestinations[0] must be a valid Stellar address (G...), got "abc"`, so a
+client can point at the offending field.
+
+#### Example
+
+```json
+{
+  "maxTxAmount": { "XLM": "25", "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN": "10" },
+  "dailySpendingLimit": { "XLM": "200", "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN": "50" },
+  "allowedAssets": ["XLM", "USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN"],
+  "allowedDestinations": ["GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"],
+  "txTypeRestrictions": { "payment": true, "contract_call": true },
+  "approvalThreshold": "20"
+}
+```
+
+This body normalizes to `txTypeRestrictions` `{ "payment": true,
+"trustline": true, "contract_call": true, "account_settings": false }` — the two
+unsent keys keep their defaults — with
+`requireHumanApprovalForAmountAbove: "20"` alongside `approvalThreshold: "20"`.
+
 ### GET /agents/:id/policy
 
 Get the agent's effective policy rules (owner-scoped). Returns
